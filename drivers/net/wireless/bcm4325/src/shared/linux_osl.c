@@ -35,6 +35,7 @@
 #include <bcmutils.h>
 #include <linux/delay.h>
 #include <pcicfg.h>
+#include <linux/mutex.h>
 
 #define PCI_CFG_RETRY 		10
 
@@ -155,20 +156,22 @@ void * dhd_os_prealloc(int section, unsigned long size);
 osl_t *
 osl_attach(void *pdev, uint bustype, bool pkttag)
 {
-	osl_t *osh;
+	osl_t *osh = NULL;
+	gfp_t flags;
 
-/* BEGIN: 0005533 mingi.sung@lge.com 2010-03-27 */
-/* MOD 0005533: [WLAN] Fixing WBT issues on Wi-Fi driver */
-/* WBT Fix TD# 248394, 248395 */
-	if(!(osh = kmalloc(sizeof(osl_t), GFP_ATOMIC))){
+    // START: WHAT'S MY PROBLEM!!!!!!!!!!!!!!!!
+    // Can someone tell me what is problem here?
+    while (NULL == osh) {
+        flags = (in_atomic()) ? GFP_ATOMIC : GFP_KERNEL;
+	    osh = kzalloc(sizeof(osl_t), flags);
+    }
+    // END: WHAT'S MY PROBLEM!!!!!!!!!!!!!!!!
 	ASSERT(osh);
+
+	if (!osh) {
 		return NULL;
 	}
-/* END: 0005533 mingi.sung@lge.com 2010-03-27 */
 
-	bzero(osh, sizeof(osl_t));
-
-	
 	ASSERT(ABS(BCME_LAST) == (ARRAYSIZE(linuxbcmerrormap) - 1));
 
 	osh->magic = OS_HANDLE_MAGIC;
@@ -258,11 +261,12 @@ void*
 osl_pktget(osl_t *osh, uint len)
 {
 	struct sk_buff *skb;
+	gfp_t flags;
 
-	if ((skb = dev_alloc_skb(len))) {
+	flags = (in_atomic()) ? GFP_ATOMIC : GFP_KERNEL;
+	if ((skb = __dev_alloc_skb(len, flags))) {
 		skb_put(skb, len);
 		skb->priority = 0;
-
 
 		osh->pub.pktalloced++;
 	}
@@ -357,8 +361,6 @@ osl_pktget_static(osl_t *osh, uint len)
 		
 		return skb;
 	}
-
-
 	
 	mutex_unlock(&bcm_static_skb->osl_pkt_sem);
 	printk("all static pkt in use!\n");
@@ -373,7 +375,8 @@ osl_pktfree_static(osl_t *osh, void *p, bool send)
 	
 	for (i = 0; i < MAX_STATIC_PKT_NUM*2; i++)
 	{
-		if (p == bcm_static_skb->skb_4k[i])
+		if ( (i < MAX_STATIC_PKT_NUM && p == bcm_static_skb->skb_4k[i]) ||
+		  (i >= MAX_STATIC_PKT_NUM && p == bcm_static_skb->skb_8k[i-MAX_STATIC_PKT_NUM]) )
 		{
 			mutex_lock(&bcm_static_skb->osl_pkt_sem);
 			bcm_static_skb->pkt_use[i] = 0;

@@ -40,6 +40,7 @@
 #include <linux/ethtool.h>
 #include <linux/fcntl.h>
 #include <linux/fs.h>
+#include <linux/mutex.h>
 
 #include <asm/uaccess.h>
 #include <asm/unaligned.h>
@@ -75,6 +76,13 @@
 volatile bool dhd_mmc_suspend = FALSE;
 DECLARE_WAIT_QUEUE_HEAD(dhd_dpc_wait);
 #endif /* (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 27)) && defined(CONFIG_PM_SLEEP) */
+
+/* LGE_CHANGE_S, jisung.yang@lge.com, 2011-4-24, reset wi-fi driver when there a resumed on timeout */
+#if defined(CONFIG_LGE_BCM432X_PATCH)		//by sjpark 11-01-11 : send hang event
+int net_os_send_hang_message(struct net_device *dev);
+extern int wl_iw_send_priv_event( struct net_device *dev, char *evntmsg );
+#endif
+/* LGE_CHANGE_E, jisung.yang@lge.com, 2011-4-24, reset wi-fi driver when there a resumed on timeout */
 
 #if defined(OOB_INTR_ONLY)
 extern void dhd_enable_oob_intr(struct dhd_bus *bus, bool enable);
@@ -139,7 +147,11 @@ typedef struct dhd_info {
 	long dpc_pid;
 	struct semaphore dpc_sem;
 	struct completion dpc_exited;
-
+/* LGE_CHANGE_S, jisung.yang@lge.com, 2011-4-24, reset wi-fi driver when there a resumed on timeout */	
+#if defined(CONFIG_LGE_BCM432X_PATCH)		//by sjpark 11-01-11 : send hang event
+	int hang_was_sent; /* flag that message was send at least once */
+#endif
+/* LGE_CHANGE_E, jisung.yang@lge.com, 2011-4-24, reset wi-fi driver when there a resumed on timeout */	
 	/* Thread to work on multicast and multiple interfaces */
 	long sysioc_pid;
 	struct semaphore sysioc_sem;
@@ -1498,6 +1510,14 @@ dhd_ioctl_entry(struct net_device *net, struct ifreq *ifr, int cmd)
 
 	bcmerror = dhd_prot_ioctl(&dhd->pub, ifidx, (wl_ioctl_t *)&ioc, buf, buflen);
 
+/* LGE_CHANGE_S, jisung.yang@lge.com, 2011-4-24, reset wi-fi driver when there a resumed on timeout */	
+#if defined(CONFIG_LGE_BCM432X_PATCH)		//by sjpark 11-01-11 : send hang event
+	if (bcmerror == -ETIMEDOUT) {			
+			net_os_send_hang_message(net);
+	}
+#endif
+/* LGE_CHANGE_E, jisung.yang@lge.com, 2011-4-24, reset wi-fi driver when there a resumed on timeout */	
+
 	WAKE_UNLOCK(&dhd->pub, WAKE_LOCK_IOCTL);
 	WAKE_LOCK_DESTROY(&dhd->pub, WAKE_LOCK_IOCTL);
 done:
@@ -1513,6 +1533,25 @@ done:
 
 	return OSL_ERROR(bcmerror);
 }
+
+/* LGE_CHANGE_S, jisung.yang@lge.com, 2011-4-24, reset wi-fi driver when there a resumed on timeout */
+#if defined(CONFIG_LGE_BCM432X_PATCH)		//by sjpark 11-01-11 : send hang event
+int net_os_send_hang_message(struct net_device *dev)
+{
+	dhd_info_t *dhd = *(dhd_info_t **)netdev_priv(dev);
+	int ret = 0;
+
+	if (dhd) {
+		if (!dhd->hang_was_sent) {
+			dhd->hang_was_sent = 1;
+			DHD_ERROR(("%s: Event HANGED send up\n", __FUNCTION__));
+			ret = wl_iw_send_priv_event(dev, "HANGED");
+		}
+	}
+	return ret;
+}
+#endif
+/* LGE_CHANGE_E, jisung.yang@lge.com, 2011-4-24, reset wi-fi driver when there a resumed on timeout */
 
 static int
 dhd_stop(struct net_device *net)
@@ -1804,21 +1843,17 @@ dhd_bus_start(dhd_pub_t *dhdp)
 
 	DHD_TRACE(("%s: \n", __FUNCTION__));
 
+	dhd_os_sdlock(dhdp);
+
 	/* try to download image and nvram to the dongle */
 	if  (dhd->pub.busstate == DHD_BUS_DOWN) {
-		WAKE_LOCK_INIT(dhdp, WAKE_LOCK_DOWNLOAD, "dhd_bus_start");
-		WAKE_LOCK(dhdp, WAKE_LOCK_DOWNLOAD);
 		if (!(dhd_bus_download_firmware(dhd->pub.bus, dhd->pub.osh,
 		                                fw_path, nv_path))) {
 			DHD_ERROR(("%s: dhdsdio_probe_download failed. firmware = %s nvram = %s\n",
 			           __FUNCTION__, fw_path, nv_path));
-			WAKE_UNLOCK(dhdp, WAKE_LOCK_DOWNLOAD);
-			WAKE_LOCK_DESTROY(dhdp, WAKE_LOCK_DOWNLOAD);
+			dhd_os_sdunlock(dhdp);
 			return -1;
 		}
-
-		WAKE_UNLOCK(dhdp, WAKE_LOCK_DOWNLOAD);
-		WAKE_LOCK_DESTROY(dhdp, WAKE_LOCK_DOWNLOAD);
 	}
 
 	/* Start the watchdog timer */
@@ -1826,8 +1861,9 @@ dhd_bus_start(dhd_pub_t *dhdp)
 	dhd_os_wd_timer(&dhd->pub, dhd_watchdog_ms);
 
 	/* Bring up the bus */
-	if ((ret = dhd_bus_init(&dhd->pub, TRUE)) != 0) {
+	if ((ret = dhd_bus_init(&dhd->pub, FALSE)) != 0) {
 		DHD_ERROR(("%s, dhd_bus_init failed %d\n", __FUNCTION__, ret));
+		dhd_os_sdunlock(dhdp);
 		return ret;
 	}
 
@@ -1838,6 +1874,7 @@ dhd_bus_start(dhd_pub_t *dhdp)
 		del_timer(&dhd->timer);
 		dhd->wd_timer_valid = FALSE;
 		DHD_ERROR(("%s Host failed to resgister for OOB\n", __FUNCTION__));
+		dhd_os_sdunlock(dhdp);
 		return -ENODEV;
 	}
 
@@ -1852,8 +1889,11 @@ dhd_bus_start(dhd_pub_t *dhdp)
 		del_timer(&dhd->timer);
 		dhd->wd_timer_valid = FALSE;
 		DHD_ERROR(("%s failed bus is not ready\n", __FUNCTION__));
+		dhd_os_sdunlock(dhdp);
 		return -ENODEV;
 	}
+
+	dhd_os_sdunlock(dhdp);
 
 	/* Bus is ready, do any protocol initialization */
 	if ((ret = dhd_prot_init(&dhd->pub)) < 0)
